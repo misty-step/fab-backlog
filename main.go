@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sort"
@@ -16,14 +17,16 @@ var (
 	org       = flag.String("org", "misty-step", "GitHub org/owner to scan")
 	minIssues = flag.Int("min-issues", 5, "minimum issues threshold for health score")
 	staleDays = flag.Int("stale-days", 90, "stale threshold in days")
+	quiet     = flag.Bool("quiet", false, "suppress info/warn logs (only errors shown)")
+	jsonLogs  = flag.Bool("json-logs", false, "emit logs as JSON (default: text)")
 )
 
 type output struct {
 	GeneratedAt string      `json:"generatedAt"`
-	Org         string     `json:"org"`
-	Config      config     `json:"config"`
-	Repos      []repoScore `json:"repos"`
-	Summary    summary    `json:"summary"`
+	Org         string      `json:"org"`
+	Config      config      `json:"config"`
+	Repos       []repoScore `json:"repos"`
+	Summary     summary     `json:"summary"`
 }
 
 type config struct {
@@ -69,20 +72,49 @@ type repoInfo struct {
 
 func main() {
 	flag.Parse()
+
+	// Configure slog based on --quiet and --json-logs flags.
+	logLevel := slog.LevelInfo
+	if *quiet {
+		logLevel = slog.LevelError
+	}
+	var handler slog.Handler
+	if *jsonLogs {
+		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+	}
+	slog.SetDefault(slog.New(handler))
+
+	slog.Info("fab-backlog starting", "org", *org, "min_issues", *minIssues, "stale_days", *staleDays)
+
 	out := output{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Org:         *org,
 		Config:      config{MinIssues: *minIssues, StaleDays: *staleDays},
 		Repos:       []repoScore{},
 	}
+
+	slog.Info("scanning repos", "org", *org)
 	repos, err := ghListRepos(*org)
 	if err != nil {
+		slog.Error("failed to list repos", "org", *org, "error", err)
 		emitJSON(map[string]any{"ok": false, "error": "failed to list repos: " + err.Error()})
 		os.Exit(1)
 	}
+	slog.Info("repo scan complete", "org", *org, "count", len(repos))
+
 	for _, repo := range repos {
-		out.Repos = append(out.Repos, computeRepoScore(repo, *org, *minIssues, *staleDays))
+		slog.Info("analysing repo", "repo", repo)
+		rs := computeRepoScore(repo, *org, *minIssues, *staleDays)
+		if rs.Error != "" {
+			slog.Warn("repo analysis error", "repo", repo, "error", rs.Error)
+		} else {
+			slog.Info("repo analysis complete", "repo", repo, "health_score", rs.HealthScore, "status", rs.Status, "total_open", rs.TotalOpen, "stale_count", rs.StaleCount)
+		}
+		out.Repos = append(out.Repos, rs)
 	}
+
 	sort.Slice(out.Repos, func(i, j int) bool {
 		if out.Repos[i].Error != "" && out.Repos[j].Error == "" {
 			return false
@@ -92,17 +124,29 @@ func main() {
 		}
 		return out.Repos[i].HealthScore < out.Repos[j].HealthScore
 	})
+
 	for _, r := range out.Repos {
 		if r.Error != "" {
 			continue
 		}
 		switch r.Status {
-		case "healthy": out.Summary.Healthy++
-		case "warning": out.Summary.Warning++
-		case "critical": out.Summary.Critical++
+		case "healthy":
+			out.Summary.Healthy++
+		case "warning":
+			out.Summary.Warning++
+		case "critical":
+			out.Summary.Critical++
 		}
 		out.Summary.Total++
 	}
+
+	slog.Info("completed",
+		"total", out.Summary.Total,
+		"healthy", out.Summary.Healthy,
+		"warning", out.Summary.Warning,
+		"critical", out.Summary.Critical,
+	)
+
 	emitJSON(out)
 }
 
